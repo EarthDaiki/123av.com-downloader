@@ -4,6 +4,7 @@ import re
 from SegmentsDownload import Downloader
 import json
 import demjson3
+from sub_processes.network import _123AVWebManager
 
 import time
 
@@ -13,7 +14,7 @@ class _123AV:
         Initializes the _123AV class with a persistent HTTP session.
         '''
         self.session = requests.Session()
-
+        self.web_manager = _123AVWebManager()
         self.verify = False
         if not self.verify:
             from urllib3.exceptions import InsecureRequestWarning
@@ -82,18 +83,9 @@ class _123AV:
         Returns:
             dict: A dictionary containing video metadata, including the stream URL.
         '''
-        res = self.session.get(url)
-        if res.status_code == 200:
-            soup = BeautifulSoup(res.text, "html.parser")
-            url_element = soup.find(id='player').get('v-scope')
-            match = re.search(r'Video\(\d+,\s*({.*})\)', url_element)
-            if match:
-                json_str = match.group(1)
-                json_str = json_str.replace(r'\/', '/')  # スラッシュを正規化
-                data = json.loads(json_str)
-            return data
-        else:
-            raise ValueError(f"status code: {res.status_code} error.")
+        master_url = self.web_manager.get_master_url(url)
+        return master_url
+        
         
     def __get_segments(self, index_url):
         '''
@@ -116,6 +108,8 @@ class _123AV:
             matches = re.findall(r'^(?!#).+', res.text, re.MULTILINE)
             urls = [index_url.rsplit('/', 1)[0] + '/' + match.rsplit('.', 1)[0] + '.ts' for match in matches]
             return urls
+        else:
+            raise Exception(f"Failed to get index_url: {res.status_code}")
         
     def __get_index_url(self, url):
         '''
@@ -130,8 +124,22 @@ class _123AV:
         Returns:
             str: The constructed URL pointing to the master `.m3u8` playlist.
         '''
-        index_url = url.rsplit('/', 1)[0] + '/qc/v.m3u8'
-        return index_url
+        max_res = 0
+        res = requests.get(url)
+        if res.status_code == 200:
+            lines = res.text.strip().splitlines()
+            for i, line in enumerate(lines):
+                if "RESOLUTION=" in line:
+                    # 例: RESOLUTION=1920x1080 → 幅と高さを取得
+                    res_str = line.split("RESOLUTION=")[1].split(",")[0]
+                    w, h = map(int, res_str.split("x"))
+                    pixels = w * h  # 総画素数を比較
+                    if pixels > max_res:
+                        max_res = pixels
+                        if i + 1 < len(lines):
+                            index_url = lines[i + 1]
+                            
+            return url.rsplit('/', 1)[0] + '/' + index_url
 
     def __get_safe_title(self, soup, max_length=100):
         '''
@@ -181,77 +189,14 @@ class _123AV:
         if video_urls is None:
             raise ValueError("could not get video urls.")
         # Using video_urls, get master url
-        for video_url in video_urls:
-            master_url = self.__get_master_url(video_url)
-            index_url = self.__get_index_url(master_url['stream'])
+        for index, video_url in enumerate(video_urls):
+            print(f"URL: {url}")
+            master_url = self.__get_master_url(url)
+            print(f"MASTER URL: {master_url}")
+            index_url = self.__get_index_url(master_url)
+            print(f"INDEX URL: {index_url}")
             urls = self.__get_segments(index_url)
             segment_urls.extend(urls)
+            if index < len(video_urls) - 1:
+                self.web_manager.click(index + 1)
         downloader.get_video(segment_urls, outputfolder, title)
-
-'''
-By updating, these methods are not used right now.
-'''
-
-# def __get_html(self, url):
-#     '''
-#     Retrieves the full HTML of the video page, including iframe contents,
-#     using a headless Chrome browser.
-
-#     Args:
-#         url (str): The URL of the 123AV video page.
-
-#     Returns:
-#         str: The HTML content of the page.
-#     '''
-#     if url is None or "":
-#         raise ValueError("Video url is None. Set a proper video url.")
-#     options = Options()
-#     options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36")
-#     options.add_argument("--headless=new")
-#     driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
-#     driver.get(url)
-#     iframe = WebDriverWait(driver, 20).until(
-#         EC.presence_of_element_located((By.TAG_NAME, "iframe"))
-#     )
-#     html = driver.page_source
-#     driver.quit()
-#     return html
-
-# def __get_video_url(self, html):
-#     '''
-#     Extracts the video iframe URL from the page's HTML and constructs
-#     the video page URL used to access the actual video player.
-
-#     This method is required to get a video.m3u8!!
-
-#     Args:
-#         html (str): The HTML content of the original 123AV video page.
-
-#     Returns:
-#         str: The constructed video player page URL.
-#     '''
-#     if html is None:
-#         raise ValueError("html is None.")
-#     soup = BeautifulSoup(html, "html.parser")
-#     url = soup.find("iframe").get('src')
-#     return url
-
-# def __get_index_url(self, m3u8_url):
-#     '''
-#     Retrieves the actual .m3u8 playlist URL from the master playlist.
-
-#     Args:
-#         m3u8_url (str): The URL to the master .m3u8 playlist.
-
-#     Returns:
-#         str: The full URL to the actual .m3u8 file containing segment list.
-#     '''
-#     if m3u8_url is None:
-#         raise ValueError("m3u8_url is None. Cannot proceed to fetch index URL.")
-#     res = self.session.get(m3u8_url)
-#     if res.status_code == 200:
-#         match = re.search(r'^.*\.m3u8$', res.text, flags=re.MULTILINE)
-#         if match:
-#             base_url = m3u8_url.rsplit('/', 1)[0]
-#             path = match.group()
-#             return base_url + '/' + path
