@@ -2,13 +2,14 @@ import requests
 import re
 import subprocess
 import os
-import concurrent.futures
-import time
-import sys
+import asyncio
+import aiohttp
+import aiofiles
 
 class Downloader:
     def __init__(self):
         self.download_failed = False
+        self.MIN_TS_SIZE = 1 * 1024
 
         self.verify = False
         if not self.verify:
@@ -22,7 +23,7 @@ class Downloader:
             os.makedirs(path)
             print(f'MADE: {path}')
 
-    def download_segment(self, url, file_path):
+    async def download_segment(self, session: aiohttp.ClientSession, sem, url, file_path):
         """ 1つの動画セグメントをダウンロードする（リトライ機能付き） """
         retry_count = 0
         max_retries = 3  
@@ -31,25 +32,21 @@ class Downloader:
             if getattr(self, 'download_failed', False):
                 return
             try:
-                with requests.get(url, timeout=10, stream=True, verify=self.verify) as r:
-                    if r.status_code == 200:
-                        with open(file_path, 'wb') as f:
-                            for chunk in r.iter_content(chunk_size=8192):
-                                f.write(chunk)
-                        # print(f"✅ Downloaded: {file_path}")
-                        return file_path  # 成功時はファイル名を返す
-                    else:
-                        print() 
-                        print(f"⚠️ Failed to download {url} (Status: {r.status_code})", end='\r', flush=True)
+                async with sem:
+                    async with session.get(url, timeout=10, ssl=self.verify) as r:
+                        r.raise_for_status()
+                        async with aiofiles.open(file_path, "wb") as f:
+                            async for chunk in r.content.iter_chunked(8192):
+                                await f.write(chunk)
+                                # print(f"✅ Downloaded: {file_path}")
+                return file_path  # 成功時はファイル名を返す
 
-            except requests.exceptions.RequestException as e:
-                # print(f"⚠️ Error downloading {url}: {e}", end='\r', flush=True)
-                pass
-
-            retry_count += 1
-            wait_time = 5
-            print(f"🔄 Retrying... ({retry_count}/{max_retries}) Sleep for {wait_time} seconds.", end='\r', flush=True)
-            time.sleep(wait_time)
+            except aiohttp.ClientError as e:
+                retry_count += 1
+                wait_time = 5
+                print(f"⚠️ {url} failed: {type(e).__name__}: {e}", flush=True)
+                print(f"🔄 Retrying... ({retry_count}/{max_retries}) Sleep for {wait_time} seconds.", end='\r', flush=True)
+                await asyncio.sleep(wait_time)
 
         # print(f"❌ Failed to download after {max_retries} retries: {url}", end='\r', flush=True)
 
@@ -57,7 +54,7 @@ class Downloader:
         self.download_failed = True
         raise RuntimeError(f"Download failed: {url}")
 
-    def download_video(self, urls, download_folder, filename):
+    async def download_video(self, urls, download_folder, filename):
         """ 並列処理で動画セグメントをダウンロード（進捗を上書き表示） """
         self.__check_folder_exsist(download_folder)
         downloaded_files = set()
@@ -65,33 +62,43 @@ class Downloader:
         completed_segments = 0
 
         print('#' * 60)
+        sem = asyncio.Semaphore(20)
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
-            futures = {}
+        connector = aiohttp.TCPConnector(
+            limit=20,
+            limit_per_host=10
+        )
+
+        timeout = aiohttp.ClientTimeout(total=60)
+
+        async with aiohttp.ClientSession(
+            connector=connector,
+            timeout=timeout
+        ) as session:
+            
+            tasks = []
+
             for idx, url in enumerate(urls):
                 file_path = os.path.join(download_folder, f"{filename}{idx}.ts")
                 if os.path.exists(file_path):
-                    downloaded_files.add(file_path)
-                    completed_segments += 1
-                    progress = (completed_segments / total_segments) * 100
-                    if completed_segments == total_segments:
-                        print(f"Download Progress: {progress:.2f}% ({completed_segments}/{total_segments})")
-                        print('Download Completed.')
-                    else:
+                    if os.path.getsize(file_path) > self.MIN_TS_SIZE:
+                        downloaded_files.add(file_path)
+                        completed_segments += 1
+                        progress = (completed_segments / total_segments) * 100
                         print(f"Download Progress: {progress:.2f}% ({completed_segments}/{total_segments})", end='\r', flush=True)
-                    continue
-                future = executor.submit(self.download_segment, url, file_path)
-                futures[future] = file_path
+                        continue
+                    else:
+                        os.remove(file_path)
+                tasks.append(self.download_segment(session, sem, url, file_path))
 
             try:
-                for future in concurrent.futures.as_completed(futures):
+                for coro in asyncio.as_completed(tasks):
                     try:
-                        result = future.result()  # ここで RuntimeError が上がる
+                        result = await coro  # ここで RuntimeError が上がる
                     except RuntimeError as e:
                         print(f"🚨 Critical Error: {e}")
                         print("⛔ Error detected, shutting down all downloads.")
-                        executor.shutdown(wait=False, cancel_futures=True)
-                        sys.exit(1)
+                        raise RuntimeError("Download aborted")
 
                     downloaded_files.add(result)
                     completed_segments += 1
@@ -104,8 +111,7 @@ class Downloader:
 
             except Exception as e:
                 print(f"❌ Unexpected exception: {e}", end='\r', flush=True)
-                executor.shutdown(wait=False, cancel_futures=True)
-                sys.exit(1)
+                raise RuntimeError("Download aborted")
 
         print('#' * 60)
         print()  # 最終進捗表示のあと改行
@@ -137,7 +143,7 @@ class Downloader:
         self.__check_folder_exsist(output_folder)
 
         # 1. ダウンロードする（並列処理）
-        downloaded_files = self.download_video(urls, temp_folder, filename)
+        downloaded_files = asyncio.run(self.download_video(urls, temp_folder, filename))
         
         if not downloaded_files:
             print("No files downloaded. Exiting...")
