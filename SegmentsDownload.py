@@ -8,7 +8,6 @@ import aiofiles
 
 class Downloader:
     def __init__(self):
-        self.download_failed = False
         self.MIN_TS_SIZE = 1 * 1024
 
         self.verify = False
@@ -26,11 +25,9 @@ class Downloader:
     async def download_segment(self, session: aiohttp.ClientSession, sem, url, file_path):
         """ 1つの動画セグメントをダウンロードする（リトライ機能付き） """
         retry_count = 0
-        max_retries = 3  
+        max_retries = 5  
 
         while retry_count < max_retries:
-            if getattr(self, 'download_failed', False):
-                return
             try:
                 async with sem:
                     async with session.get(url, timeout=10, ssl=self.verify) as r:
@@ -41,7 +38,7 @@ class Downloader:
                                 # print(f"✅ Downloaded: {file_path}")
                 return file_path  # 成功時はファイル名を返す
 
-            except aiohttp.ClientError as e:
+            except (asyncio.TimeoutError, aiohttp.ClientError) as e:
                 retry_count += 1
                 wait_time = 5
                 print(f"⚠️ {url} failed: {type(e).__name__}: {e}", flush=True)
@@ -50,9 +47,7 @@ class Downloader:
 
         # print(f"❌ Failed to download after {max_retries} retries: {url}", end='\r', flush=True)
 
-        # 失敗したことを記録し、スレッドプールを停止するために例外を投げる
-        self.download_failed = True
-        raise RuntimeError(f"Download failed: {url}")
+        raise RuntimeError(f"Download failed: {url} DO ONE MORE TIME.")
 
     async def download_video(self, urls, download_folder, filename):
         """ 並列処理で動画セグメントをダウンロード（進捗を上書き表示） """
@@ -69,7 +64,11 @@ class Downloader:
             limit_per_host=10
         )
 
-        timeout = aiohttp.ClientTimeout(total=60)
+        timeout = aiohttp.ClientTimeout(
+            total=None,
+            sock_connect=10,
+            sock_read=30
+        )
 
         async with aiohttp.ClientSession(
             connector=connector,
@@ -89,19 +88,21 @@ class Downloader:
                         continue
                     else:
                         os.remove(file_path)
-                tasks.append(self.download_segment(session, sem, url, file_path))
+                tasks.append(
+                    asyncio.create_task(
+                        self.download_segment(session, sem, url, file_path)
+                    )
+                )
 
             try:
-                for coro in asyncio.as_completed(tasks):
-                    try:
-                        result = await coro  # ここで RuntimeError が上がる
-                    except RuntimeError as e:
-                        print(f"🚨 Critical Error: {e}")
-                        print("⛔ Error detected, shutting down all downloads.")
-                        raise RuntimeError("Download aborted")
-
+                for task in asyncio.as_completed(tasks):
+                    result = await task  # ここで RuntimeError が上がる
+                    if result is None:
+                        download_failed += 1
+                        continue
                     downloaded_files.add(result)
                     completed_segments += 1
+
                     progress = (completed_segments / total_segments) * 100
                     if completed_segments == total_segments:
                         print(f"Download Progress: {progress:.2f}% ({completed_segments}/{total_segments})")
@@ -109,12 +110,16 @@ class Downloader:
                     else:
                         print(f"Download Progress: {progress:.2f}% ({completed_segments}/{total_segments})", end='\r', flush=True)
 
-            except Exception as e:
-                print(f"❌ Unexpected exception: {e}", end='\r', flush=True)
-                raise RuntimeError("Download aborted")
+            finally:
+                # 念のため残タスクを完全回収
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
 
         print('#' * 60)
         print()  # 最終進捗表示のあと改行
+        print(f"Download Failed Count: {download_failed}")
         return downloaded_files
     
     def check_fake_extension(self, downloaded_files):

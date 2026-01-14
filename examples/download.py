@@ -13,4 +13,4 @@ Change URL and output folder
 
 if __name__ == "__main__":
     app = _123AV()
-    app.dl('https://123av.ws/en/v/atid-660', r'D:\DaikiVideos\123AV')
+    app.dl('https://123av.com/en/v/fc2-ppv-4828384', r'D:\DaikiVideos\123AV')
