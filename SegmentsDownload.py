@@ -55,6 +55,7 @@ class Downloader:
         downloaded_files = set()
         total_segments = len(urls)
         completed_segments = 0
+        download_failed = 0
 
         print('#' * 60)
         sem = asyncio.Semaphore(20)
