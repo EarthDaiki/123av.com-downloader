@@ -150,6 +150,13 @@ class Downloader:
         # check a folder that stores videos
         self.__check_folder_exsist(output_folder)
 
+        # 2. 出力ファイル名を決定
+        output_file = os.path.join(output_folder, f"{filename}.mp4")
+
+        # 同じファイル名のmp4がすでにあるなら、ダウンロード前に止める
+        if os.path.exists(output_file):
+            raise FileExistsError(f"Output file already exists: {output_file}")
+
         # 1. ダウンロードする（並列処理）
         downloaded_files = asyncio.run(self.download_video(urls, temp_folder, filename))
         
@@ -160,9 +167,6 @@ class Downloader:
         # if downloaded files' extensions are jpeg, change it to ts.
         if self.check_fake_extension(downloaded_files):
             downloaded_files = self.change_extension(downloaded_files)
-
-        # 2. 出力ファイル名を決定
-        output_file = os.path.join(output_folder, f"{filename}.mp4")
         
         # 3. ffmpegのリストファイルを作成
         list_file = f"{temp_folder}/temp_file_list.txt"
